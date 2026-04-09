@@ -5,3 +5,9 @@ __pycache__/
 .DS_Store
 out/
 ctm_daily_reports/
+ctm_daily_summary_*.html
+ctm_daily_summary_*.json
+ctm_calls_*.csv
+ctm_agents_*.csv
+ctm_sources_*.csv
+ctm_agent_sources_*.csv

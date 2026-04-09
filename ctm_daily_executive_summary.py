@@ -1,4 +1,17 @@
 #!/usr/bin/env python3
+"""
+ctm_daily_executive_summary.py
+
+Fetches yesterday's CTM call activities, aggregates operational and AI-derived
+metrics by agent and source, generates an email-safe HTML executive summary,
+and posts it to a Make.com webhook for Gmail delivery.
+
+Usage:
+    python3 ctm_daily_executive_summary.py [options]
+
+See README.md or --help for full option reference.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -6,6 +19,7 @@ import csv
 import datetime as dt
 import html
 import json
+import logging
 import os
 import re
 import time
@@ -17,14 +31,86 @@ from urllib.parse import urlparse
 
 import requests
 
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
 
-ACCOUNT_ID = os.getenv("CTM_ACCOUNT_ID", "")
-DEFAULT_WEBHOOK_URL = os.getenv("CTM_WEBHOOK_URL", "")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
 DEFAULT_BASE_URL = "https://api.calltrackingmetrics.com/api/v1"
 DEFAULT_TIME_DURATION = "yesterday"
 DEFAULT_TIMEZONE = "America/Chicago"
-DEFAULT_LOGO_URL = os.getenv("CTM_LOGO_URL", "")
-HARDCODED_CTM_API_KEY = ""
+DEFAULT_MAX_DETAIL_ROWS = 75
+DEFAULT_SLEEP_S = 0.1
+DEFAULT_PER_PAGE = 100
+
+# ---------------------------------------------------------------------------
+# Credentials
+# ---------------------------------------------------------------------------
+
+
+def _load_env_file() -> dict[str, str]:
+    """Load key:value pairs from an ENV.txt file next to this script."""
+    env_path = Path(__file__).with_name("ENV.txt")
+    if not env_path.exists():
+        return {}
+    data: dict[str, str] = {}
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or ":" not in line:
+            continue
+        key, _, val = line.partition(":")
+        val = val.strip().strip('"').strip("'")
+        if val.startswith("{") and val.endswith("}"):
+            val = val[1:-1].strip()
+        data[key.strip()] = val
+    return data
+
+
+def _resolve_auth_header() -> str:
+    """
+    Resolve the CTM Basic Auth header value from the environment.
+    Checks CTM_API_KEY, CTM_AUTH, CTM_BASIC_AUTH in that order,
+    then falls back to ENV.txt.
+    Raises SystemExit if no credential is found.
+    """
+    env = _load_env_file()
+    for key in ("CTM_API_KEY", "CTM_AUTH", "CTM_BASIC_AUTH"):
+        val = os.environ.get(key) or env.get(key)
+        if val:
+            val = val.strip()
+            return val if val.lower().startswith("basic ") else f"Basic {val}"
+    raise SystemExit(
+        "No CTM credentials found. Set CTM_API_KEY (or CTM_AUTH / CTM_BASIC_AUTH) "
+        "as an environment variable or in ENV.txt."
+    )
+
+
+def _resolve_config() -> dict[str, str]:
+    """Merge env vars and ENV.txt into a single config dict."""
+    env = _load_env_file()
+    keys = (
+        "CTM_ACCOUNT_ID",
+        "CTM_WEBHOOK_URL",
+        "CTM_LOGO_URL",
+        "CTM_ONVERTED_FIELD",
+        "CTM_SCORE_FIELD",
+    )
+    return {k: os.environ.get(k) or env.get(k, "") for k in keys}
+
+
+# ---------------------------------------------------------------------------
+# Safe value helpers
+# ---------------------------------------------------------------------------
 
 
 def safe_dict(value: Any) -> Dict[str, Any]:
@@ -47,14 +133,14 @@ def safe_float(value: Any) -> Optional[float]:
         return None
     try:
         return float(value)
-    except Exception:
+    except (TypeError, ValueError):
         return None
 
 
 def safe_int(value: Any, default: int = 0) -> int:
     try:
         return int(value)
-    except Exception:
+    except (TypeError, ValueError):
         return default
 
 
@@ -62,7 +148,13 @@ def normalize_wait_seconds(wait_time: Any) -> float:
     value = safe_float(wait_time)
     if value is None:
         return 0.0
+    # CTM sometimes returns milliseconds
     return value / 1000.0 if value > 1000 else value
+
+
+# ---------------------------------------------------------------------------
+# Formatting helpers
+# ---------------------------------------------------------------------------
 
 
 def fmt_num(value: Any, digits: int = 1) -> str:
@@ -87,30 +179,21 @@ def fmt_sec(value: Any) -> str:
         return "0s"
     minutes = int(seconds // 60)
     remainder = int(round(seconds % 60))
-    if minutes == 0:
-        return f"{remainder}s"
-    return f"{minutes}m {remainder:02d}s"
+    return f"{remainder}s" if minutes == 0 else f"{minutes}m {remainder:02d}s"
 
 
 def esc(value: Any) -> str:
-    if value is None:
-        return ""
-    return html.escape(str(value))
+    return "" if value is None else html.escape(str(value))
 
 
 def split_multi_value(value: Any) -> List[str]:
     if value is None:
         return []
-    if isinstance(value, list):
-        parts = value
-    else:
-        parts = re.split(r"[;\n|]+", str(value))
-    out: List[str] = []
-    for part in parts:
-        item = safe_str(part)
-        if item and item.lower() not in {"none", "null", "n/a", "na"}:
-            out.append(item)
-    return out
+    parts = value if isinstance(value, list) else re.split(r"[;\n|]+", str(value))
+    return [
+        item for part in parts
+        if (item := safe_str(part)) and item.lower() not in {"none", "null", "n/a", "na"}
+    ]
 
 
 def top_items(counter: Any, limit: int = 5) -> str:
@@ -134,8 +217,19 @@ def path_from_url(url_or_path: str) -> str:
     return url_or_path
 
 
+# ---------------------------------------------------------------------------
+# CTM API client
+# ---------------------------------------------------------------------------
+
+
 class CTMClient:
-    def __init__(self, account_id: str, base_url: str, auth_header: str, timeout: int = 60):
+    def __init__(
+        self,
+        account_id: str,
+        base_url: str,
+        auth_header: str,
+        timeout: int = 60,
+    ) -> None:
         self.account_id = account_id
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
@@ -144,11 +238,15 @@ class CTMClient:
             {
                 "Authorization": auth_header,
                 "Accept": "application/json",
-                "User-Agent": "just-right-lawns-daily-report",
+                "User-Agent": "ctm-daily-executive-summary/1.0",
             }
         )
 
-    def get(self, path_or_url: str, params: Optional[Dict[str, Any]] = None) -> Any:
+    def get(
+        self,
+        path_or_url: str,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> Any:
         path = path_from_url(path_or_url)
         if path.startswith("/api/v1"):
             url = f"{self.base_url}{path[len('/api/v1'):]}"
@@ -157,33 +255,63 @@ class CTMClient:
         else:
             url = f"{self.base_url}/{path}"
 
-        response = self.session.get(url, params=params or {}, timeout=self.timeout)
-        if response.status_code == 401:
-            raise RuntimeError(
-                "CTM authentication failed (401). "
-                "Check HARDCODED_CTM_API_KEY, CTM_AUTH, CTM_BASIC_AUTH, or CTM_API_KEY."
-            )
-        response.raise_for_status()
-        return response.json()
+        for attempt in range(3):
+            try:
+                resp = self.session.get(url, params=params or {}, timeout=self.timeout)
+            except requests.RequestException as exc:
+                if attempt < 2:
+                    log.warning("Request failed (%s) — retrying in 2 s", exc)
+                    time.sleep(2)
+                    continue
+                raise
 
-    def fetch_calls(self, time_duration: str = DEFAULT_TIME_DURATION, per_page: int = 100) -> List[Dict[str, Any]]:
+            if resp.status_code == 429:
+                log.warning("Rate limited — sleeping 5 s")
+                time.sleep(5)
+                continue
+
+            if resp.status_code == 401:
+                raise SystemExit(
+                    "CTM authentication failed (401). Check your CTM_API_KEY."
+                )
+
+            resp.raise_for_status()
+            return resp.json()
+
+        raise SystemExit("CTM API request failed after 3 attempts.")
+
+    def fetch_calls(
+        self,
+        time_duration: str = DEFAULT_TIME_DURATION,
+        per_page: int = DEFAULT_PER_PAGE,
+    ) -> List[Dict[str, Any]]:
         calls: List[Dict[str, Any]] = []
         next_path: str = f"/accounts/{self.account_id}/calls"
-        params: Optional[Dict[str, Any]] = {"per_page": per_page, "time_duration": time_duration}
+        params: Optional[Dict[str, Any]] = {
+            "per_page": per_page,
+            "time_duration": time_duration,
+        }
 
         while next_path:
+            log.info("Fetching calls: %s", next_path)
             payload = self.get(next_path, params=params)
             batch = payload.get("calls", []) if isinstance(payload, dict) else []
-            calls.extend([call for call in batch if isinstance(call, dict)])
+            calls.extend(c for c in batch if isinstance(c, dict))
+            log.info("  -> %d calls so far", len(calls))
 
             next_page = payload.get("next_page") if isinstance(payload, dict) else None
             next_path = path_from_url(next_page) if next_page else ""
-            params = None
+            params = None  # params are embedded in next_page URL
 
         return calls
 
     def fetch_call_detail(self, call_id: Any) -> Dict[str, Any]:
         return self.get(f"/accounts/{self.account_id}/calls/{call_id}")
+
+
+# ---------------------------------------------------------------------------
+# Call hydration
+# ---------------------------------------------------------------------------
 
 
 def merge_call(base_call: Dict[str, Any], detail_call: Dict[str, Any]) -> Dict[str, Any]:
@@ -215,18 +343,29 @@ def hydrate_calls(
             and call.get("summary") is not None
             and call.get("agent") is not None
         )
+
         if not call_id or not needs_detail:
             hydrated.append(call)
             continue
 
-        detail = client.fetch_call_detail(call_id)
-        hydrated.append(merge_call(call, detail))
+        try:
+            detail = client.fetch_call_detail(call_id)
+            hydrated.append(merge_call(call, detail))
+        except Exception as exc:
+            log.warning("Failed to fetch detail for call %s: %s", call_id, exc)
+            hydrated.append(call)
+
         if sleep_s:
             time.sleep(sleep_s)
         if index % 25 == 0:
-            print(f"Hydrated {index}/{len(calls)} calls...")
+            log.info("Hydrated %d / %d calls", index, len(calls))
 
     return hydrated
+
+
+# ---------------------------------------------------------------------------
+# Data normalization
+# ---------------------------------------------------------------------------
 
 
 def normalize_yes_no(value: Any) -> str:
@@ -238,13 +377,15 @@ def normalize_yes_no(value: Any) -> str:
     return safe_str(value, "Unknown")
 
 
-def extract_call_record(call: Dict[str, Any]) -> Dict[str, Any]:
+def extract_call_record(
+    call: Dict[str, Any],
+    converted_field: str = "did_the_caller_schedule",
+    score_field: str = "cumulative_score_percentage",
+) -> Dict[str, Any]:
     cf = safe_dict(call.get("custom_fields"))
     agent = safe_dict(call.get("agent"))
-
     missed_questions = split_multi_value(cf.get("missed_questions"))
-    score = safe_float(cf.get("cumulative_score_percentage"))
-    rating = safe_float(cf.get("agent_star_rating"))
+    score = safe_float(cf.get(score_field))
 
     return {
         "id": call.get("id"),
@@ -255,7 +396,9 @@ def extract_call_record(call: Dict[str, Any]) -> Dict[str, Any]:
         "direction": safe_str(call.get("direction"), "Unknown"),
         "status": safe_str(call.get("status") or call.get("call_status"), "Unknown"),
         "dial_status": safe_str(call.get("dial_status"), "Unknown"),
-        "agent_name": safe_str(agent.get("name") or agent.get("email") or agent.get("id"), "Unassigned"),
+        "agent_name": safe_str(
+            agent.get("name") or agent.get("email") or agent.get("id"), "Unassigned"
+        ),
         "agent_email": safe_str(agent.get("email")),
         "duration": safe_int(call.get("duration")),
         "talk_time": safe_int(call.get("talk_time")),
@@ -266,48 +409,47 @@ def extract_call_record(call: Dict[str, Any]) -> Dict[str, Any]:
         "summary": safe_str(call.get("summary")),
         "service_type": safe_str(cf.get("service_type"), "Unknown"),
         "call_outcome": safe_str(cf.get("call_outcome"), "Unknown"),
-        "did_schedule": normalize_yes_no(cf.get("did_the_caller_schedule")),
+        "did_schedule": normalize_yes_no(cf.get(converted_field)),
         "objection": safe_str(cf.get("objections_reasons_not_scheduled"), "None"),
         "missed_questions": missed_questions,
         "missed_questions_text": "; ".join(missed_questions) if missed_questions else "None",
         "score": score,
-        "rating": rating,
+        "rating": safe_float(cf.get("agent_star_rating")),
         "explanation_of_outcome": safe_str(cf.get("explanation_of_outcome")),
         "call_type": safe_str(cf.get("call_type")),
-        "caller_name": safe_str(call.get("name") or safe_dict(call.get("caller")).get("name")),
+        "caller_name": safe_str(
+            call.get("name") or safe_dict(call.get("caller")).get("name")
+        ),
         "city": safe_str(call.get("city")),
         "state": safe_str(call.get("state")),
         "tracking_label": safe_str(call.get("tracking_label")),
     }
 
 
+# ---------------------------------------------------------------------------
+# Aggregation
+# ---------------------------------------------------------------------------
+
+
 def build_overview(records: List[Dict[str, Any]]) -> Dict[str, Any]:
-    total = len(records)
-    inbound_records = [r for r in records if r["direction"].lower() == "inbound"]
+    inbound = [r for r in records if r["direction"].lower() == "inbound"]
     answered = sum(
-        1
-        for r in inbound_records
+        1 for r in inbound
         if r["dial_status"].lower() == "answered" or r["status"].lower() == "answered"
     )
-    scheduled = sum(1 for r in inbound_records if r["did_schedule"] == "Yes")
-    inbound = sum(1 for r in records if r["direction"].lower() == "inbound")
-    outbound = sum(1 for r in records if r["direction"].lower() == "outbound")
-    summarized = sum(1 for r in records if r["summary"])
-    new_callers = sum(1 for r in records if r["is_new_caller"])
+    scheduled = sum(1 for r in inbound if r["did_schedule"] == "Yes")
     avg_score_values = [r["score"] for r in records if r["score"] is not None]
-    source_counter = Counter(r["source"] for r in records if r["source"] and r["source"] != "Unknown")
-    agent_counter = Counter(r["agent_name"] for r in records if r["agent_name"] and r["agent_name"] != "Unassigned")
 
     return {
-        "total_calls": total,
+        "total_calls": len(records),
         "answered_calls": answered,
-        "answered_rate": (answered / len(inbound_records) * 100) if inbound_records else 0.0,
+        "answered_rate": (answered / len(inbound) * 100) if inbound else 0.0,
         "scheduled_calls": scheduled,
-        "scheduled_rate": (scheduled / len(inbound_records) * 100) if inbound_records else 0.0,
-        "inbound_calls": inbound,
-        "outbound_calls": outbound,
-        "summarized_calls": summarized,
-        "new_callers": new_callers,
+        "scheduled_rate": (scheduled / len(inbound) * 100) if inbound else 0.0,
+        "inbound_calls": len(inbound),
+        "outbound_calls": sum(1 for r in records if r["direction"].lower() == "outbound"),
+        "summarized_calls": sum(1 for r in records if r["summary"]),
+        "new_callers": sum(1 for r in records if r["is_new_caller"]),
         "unique_agents": len({r["agent_name"] for r in records}),
         "unique_sources": len({r["source"] for r in records}),
         "avg_score": mean(avg_score_values) if avg_score_values else None,
@@ -315,9 +457,18 @@ def build_overview(records: List[Dict[str, Any]]) -> Dict[str, Any]:
         "avg_ring_time": mean([r["ring_time"] for r in records]) if records else 0.0,
         "avg_hold_time": mean([r["hold_time"] for r in records]) if records else 0.0,
         "avg_wait_time": mean([r["wait_time_s"] for r in records]) if records else 0.0,
-        "top_outcomes": Counter(r["call_outcome"] for r in records if r["call_outcome"] and r["call_outcome"] != "Unknown"),
-        "top_sources": source_counter,
-        "top_agents": agent_counter,
+        "top_outcomes": Counter(
+            r["call_outcome"] for r in records
+            if r["call_outcome"] and r["call_outcome"] != "Unknown"
+        ),
+        "top_sources": Counter(
+            r["source"] for r in records
+            if r["source"] and r["source"] != "Unknown"
+        ),
+        "top_agents": Counter(
+            r["agent_name"] for r in records
+            if r["agent_name"] and r["agent_name"] != "Unassigned"
+        ),
     }
 
 
@@ -327,20 +478,26 @@ def build_agent_breakdown(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]
         grouped[record["agent_name"]].append(record)
 
     rows: List[Dict[str, Any]] = []
-    for agent_name, calls in sorted(grouped.items(), key=lambda item: item[0].lower()):
-        total = len(calls)
+    for agent_name, calls in grouped.items():
         inbound_calls = [c for c in calls if c["direction"].lower() == "inbound"]
         answered = sum(
-            1
-            for c in inbound_calls
+            1 for c in inbound_calls
             if c["dial_status"].lower() == "answered" or c["status"].lower() == "answered"
         )
         scheduled = sum(1 for c in inbound_calls if c["did_schedule"] == "Yes")
         scores = [c["score"] for c in calls if c["score"] is not None]
-        source_counter = Counter(c["source"] for c in calls)
-        outcome_counter = Counter(c["call_outcome"] for c in calls if c["call_outcome"] != "Unknown")
-        service_counter = Counter(c["service_type"] for c in calls if c["service_type"] != "Unknown")
-        objection_counter = Counter(c["objection"] for c in calls if c["objection"] not in {"", "None", "Unknown"})
+
+        source_counter: Counter = Counter(c["source"] for c in calls)
+        outcome_counter: Counter = Counter(
+            c["call_outcome"] for c in calls if c["call_outcome"] != "Unknown"
+        )
+        service_counter: Counter = Counter(
+            c["service_type"] for c in calls if c["service_type"] != "Unknown"
+        )
+        objection_counter: Counter = Counter(
+            c["objection"] for c in calls
+            if c["objection"] not in {"", "None", "Unknown"}
+        )
         missed_counter: Counter = Counter()
         for call in calls:
             missed_counter.update(call["missed_questions"])
@@ -348,7 +505,7 @@ def build_agent_breakdown(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]
         rows.append(
             {
                 "agent_name": agent_name,
-                "calls": total,
+                "calls": len(calls),
                 "inbound_calls": len(inbound_calls),
                 "answered_calls": answered,
                 "answered_rate": answered / len(inbound_calls) * 100 if inbound_calls else 0.0,
@@ -370,7 +527,7 @@ def build_agent_breakdown(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]
             }
         )
 
-    rows.sort(key=lambda row: (-row["calls"], row["agent_name"].lower()))
+    rows.sort(key=lambda r: (-r["calls"], r["agent_name"].lower()))
     return rows
 
 
@@ -380,23 +537,23 @@ def build_source_breakdown(records: List[Dict[str, Any]]) -> List[Dict[str, Any]
         grouped[record["source"]].append(record)
 
     rows: List[Dict[str, Any]] = []
-    for source, calls in sorted(grouped.items(), key=lambda item: item[0].lower()):
-        total = len(calls)
+    for source, calls in grouped.items():
         inbound_calls = [c for c in calls if c["direction"].lower() == "inbound"]
         answered = sum(
-            1
-            for c in inbound_calls
+            1 for c in inbound_calls
             if c["dial_status"].lower() == "answered" or c["status"].lower() == "answered"
         )
         scheduled = sum(1 for c in inbound_calls if c["did_schedule"] == "Yes")
         scores = [c["score"] for c in calls if c["score"] is not None]
-        agent_counter = Counter(c["agent_name"] for c in calls)
-        outcome_counter = Counter(c["call_outcome"] for c in calls if c["call_outcome"] != "Unknown")
+        agent_counter: Counter = Counter(c["agent_name"] for c in calls)
+        outcome_counter: Counter = Counter(
+            c["call_outcome"] for c in calls if c["call_outcome"] != "Unknown"
+        )
 
         rows.append(
             {
                 "source": source,
-                "calls": total,
+                "calls": len(calls),
                 "inbound_calls": len(inbound_calls),
                 "answered_calls": answered,
                 "answered_rate": answered / len(inbound_calls) * 100 if inbound_calls else 0.0,
@@ -410,18 +567,17 @@ def build_source_breakdown(records: List[Dict[str, Any]]) -> List[Dict[str, Any]
             }
         )
 
-    rows.sort(key=lambda row: (-row["calls"], row["source"].lower()))
+    rows.sort(key=lambda r: (-r["calls"], r["source"].lower()))
     return rows
 
 
 def build_agent_source_matrix(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    grouped: Dict[tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
+    grouped: Dict[tuple, List[Dict[str, Any]]] = defaultdict(list)
     for record in records:
         grouped[(record["agent_name"], record["source"])].append(record)
 
     rows: List[Dict[str, Any]] = []
     for (agent_name, source), calls in grouped.items():
-        total = len(calls)
         inbound_calls = [c for c in calls if c["direction"].lower() == "inbound"]
         scheduled = sum(1 for c in inbound_calls if c["did_schedule"] == "Yes")
         scores = [c["score"] for c in calls if c["score"] is not None]
@@ -429,7 +585,7 @@ def build_agent_source_matrix(records: List[Dict[str, Any]]) -> List[Dict[str, A
             {
                 "agent_name": agent_name,
                 "source": source,
-                "calls": total,
+                "calls": len(calls),
                 "inbound_calls": len(inbound_calls),
                 "scheduled_calls": scheduled,
                 "scheduled_rate": scheduled / len(inbound_calls) * 100 if inbound_calls else 0.0,
@@ -437,12 +593,14 @@ def build_agent_source_matrix(records: List[Dict[str, Any]]) -> List[Dict[str, A
             }
         )
 
-    rows.sort(key=lambda row: (-row["calls"], row["agent_name"].lower(), row["source"].lower()))
+    rows.sort(key=lambda r: (-r["calls"], r["agent_name"].lower(), r["source"].lower()))
     return rows
 
 
 def build_dashboard(records: List[Dict[str, Any]], report_label: str) -> Dict[str, Any]:
-    sorted_records = sorted(records, key=lambda item: (item["unix_time"], item["id"]), reverse=True)
+    sorted_records = sorted(
+        records, key=lambda r: (r["unix_time"], r["id"]), reverse=True
+    )
     agent_breakdown = build_agent_breakdown(sorted_records)
     source_breakdown = build_source_breakdown(sorted_records)
     return {
@@ -456,74 +614,96 @@ def build_dashboard(records: List[Dict[str, Any]], report_label: str) -> Dict[st
     }
 
 
-def render_overview_cards(overview: Dict[str, Any], top_agent: str, top_source: str) -> str:
-    cards = [
-        ("Inbound Leads", overview["inbound_calls"]),
-        ("Answered Rate", fmt_pct(overview["answered_rate"])),
-        ("Booked Rate", fmt_pct(overview["scheduled_rate"])),
-        ("Avg AI Score", fmt_pct(overview["avg_score"])),
-        ("Top Agent", top_agent),
-        ("Top Source", top_source),
-    ]
-    return "".join(
-        "<div class='card'>"
-        f"<div class='label'>{esc(label)}</div>"
-        f"<div class='value'>{esc(value)}</div>"
-        "</div>"
-        for label, value in cards
-    )
+# ---------------------------------------------------------------------------
+# Coaching / notable call helpers
+# ---------------------------------------------------------------------------
 
 
-def render_table(headers: Iterable[str], rows: Iterable[Iterable[Any]]) -> str:
-    head_html = "".join(f"<th>{esc(h)}</th>" for h in headers)
-    body_parts: List[str] = []
-    for row in rows:
-        cells = "".join(f"<td>{cell}</td>" for cell in row)
-        body_parts.append(f"<tr>{cells}</tr>")
-    body_html = "".join(body_parts)
-    if not body_html:
-        body_html = '<tr><td colspan="99">No data</td></tr>'
-    return (
-        "<table>"
-        f"<thead><tr>{head_html}</tr></thead>"
-        f"<tbody>{body_html}</tbody>"
-        "</table>"
-    )
+def build_exec_bullets(
+    overview: Dict[str, Any],
+    agent_rows: List[Dict[str, Any]],
+    source_rows: List[Dict[str, Any]],
+) -> List[str]:
+    bullets: List[str] = []
+    if overview["inbound_calls"] or overview["total_calls"]:
+        bullets.append(
+            f"{overview['inbound_calls']} inbound leads generated "
+            f"{overview['scheduled_calls']} booked calls, "
+            f"a {fmt_pct(overview['scheduled_rate'])} booking rate."
+        )
+    if source_rows:
+        top = source_rows[0]
+        bullets.append(
+            f"{top['source']} led volume with {top['calls']} calls "
+            f"and converted at {fmt_pct(top['scheduled_rate'])}."
+        )
+    if agent_rows:
+        best = sorted(
+            agent_rows,
+            key=lambda r: (
+                r["scheduled_calls"], r["scheduled_rate"],
+                r["calls"], r["avg_score"] or 0,
+            ),
+            reverse=True,
+        )[0]
+        bullets.append(
+            f"{best['agent_name']} led the team with {best['scheduled_calls']} "
+            f"booked calls on {best['calls']} conversations."
+        )
+    return bullets[:3]
 
 
-def render_bullets(items: List[str]) -> str:
-    if not items:
-        return "<ul><li>No notable items.</li></ul>"
-    return "<ul>" + "".join(f"<li>{esc(item)}</li>" for item in items) + "</ul>"
+def build_team_coaching_insights(
+    agent_rows: List[Dict[str, Any]],
+    overview: Dict[str, Any],
+) -> Dict[str, Any]:
+    missed_counter: Counter = Counter()
+    objection_counter: Counter = Counter()
+    outcome_counter: Counter = Counter()
+    for row in agent_rows:
+        missed_counter.update(row["missed_counter"])
+        objection_counter.update(row["objection_counter"])
+        outcome_counter.update(row["outcome_counter"])
+    return {
+        "top_missed": missed_counter,
+        "top_objections": objection_counter,
+        "top_outcomes": outcome_counter or overview["top_outcomes"],
+    }
 
 
-def render_call_cards(title: str, subtitle: str, calls: List[Dict[str, Any]]) -> str:
-    if not calls:
-        body = "<div class='mini-empty'>No calls to highlight.</div>"
-    else:
-        cards = []
-        for row in calls:
-            cards.append(
-                "<div class='call-card'>"
-                f"<div class='call-kicker'>{esc(row['agent_name'])} · {esc(row['source'])}</div>"
-                f"<h3>{esc(row['service_type'])} · {esc(row['call_outcome'])}</h3>"
-                f"<p>{esc(row['summary'] or row['explanation_of_outcome'] or '—')}</p>"
-                f"<div class='call-meta'>Scheduled: <b>{esc(row['did_schedule'])}</b> · "
-                f"Score: <b>{esc(fmt_pct(row['score']))}</b> · Talk: <b>{esc(fmt_sec(row['talk_time']))}</b></div>"
-                "</div>"
-            )
-        body = "".join(cards)
-
-    return (
-        "<div class='call-card-panel'>"
-        f"<h3>{esc(title)}</h3>"
-        f"<p class='subtle'>{esc(subtitle)}</p>"
-        f"{body}"
-        "</div>"
-    )
+def build_notable_calls(records: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    summarized = [r for r in records if r["summary"]]
+    best_calls = sorted(
+        [r for r in summarized if r["did_schedule"] == "Yes"],
+        key=lambda r: (r["score"] or 0, r["talk_time"], r["unix_time"]),
+        reverse=True,
+    )[:3]
+    missed_calls = sorted(
+        [
+            r for r in summarized
+            if r["did_schedule"] != "Yes"
+            and (r["objection"] not in {"None", "Unknown", ""} or r["missed_questions"])
+        ],
+        key=lambda r: (r["talk_time"], -(r["score"] or 0), r["unix_time"]),
+        reverse=True,
+    )[:3]
+    return {
+        "best_calls": best_calls,
+        "missed_calls": missed_calls,
+        "recent_calls": summarized[:8],
+    }
 
 
-def render_email_table(headers: Iterable[str], rows: Iterable[Iterable[Any]], column_widths: Optional[List[str]] = None) -> str:
+# ---------------------------------------------------------------------------
+# HTML rendering helpers
+# ---------------------------------------------------------------------------
+
+
+def render_email_table(
+    headers: Iterable[str],
+    rows: Iterable[Iterable[Any]],
+    column_widths: Optional[List[str]] = None,
+) -> str:
     header_html = ""
     for idx, header in enumerate(headers):
         width_attr = ""
@@ -537,23 +717,22 @@ def render_email_table(headers: Iterable[str], rows: Iterable[Iterable[Any]], co
             f"{esc(header)}</th>"
         )
 
-    body_html = ""
     row_list = list(rows)
     if not row_list:
         body_html = (
             '<tr><td colspan="99" style="padding:12px 8px;border-bottom:1px solid #e7e0d5;'
-            'font-family:Arial,sans-serif;font-size:13px;line-height:18px;color:#6b7280;">No data</td></tr>'
+            'font-family:Arial,sans-serif;font-size:13px;line-height:18px;color:#6b7280;">'
+            "No data</td></tr>"
         )
     else:
+        body_html = ""
         for row in row_list:
-            body_html += "<tr>"
-            for cell in row:
-                body_html += (
-                    '<td valign="top" style="padding:8px 6px;border-bottom:1px solid #e7e0d5;'
-                    'font-family:Arial,sans-serif;font-size:13px;line-height:18px;color:#1f2937;">'
-                    f"{cell}</td>"
-                )
-            body_html += "</tr>"
+            body_html += "<tr>" + "".join(
+                '<td valign="top" style="padding:8px 6px;border-bottom:1px solid #e7e0d5;'
+                'font-family:Arial,sans-serif;font-size:13px;line-height:18px;color:#1f2937;">'
+                f"{cell}</td>"
+                for cell in row
+            ) + "</tr>"
 
     return (
         '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" '
@@ -564,7 +743,7 @@ def render_email_table(headers: Iterable[str], rows: Iterable[Iterable[Any]], co
     )
 
 
-def render_email_kpis(kpis: List[tuple[str, Any]]) -> str:
+def render_email_kpis(kpis: List[tuple]) -> str:
     cells = ""
     for idx, (label, value) in enumerate(kpis):
         if idx and idx % 3 == 0:
@@ -579,18 +758,15 @@ def render_email_kpis(kpis: List[tuple[str, Any]]) -> str:
             '<tr><td style="padding:0 12px 10px 12px;font-family:Arial,sans-serif;font-size:20px;'
             'line-height:24px;font-weight:700;color:#1f2937;">'
             f"{esc(value)}</td></tr>"
-            '</table></td>'
+            "</table></td>"
         )
-
     if not cells.startswith("<tr>"):
         cells = "<tr>" + cells
     if not cells.endswith("</tr>"):
         cells += "</tr>"
-
     return (
         '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" '
-        'style="width:100%;border-collapse:collapse;">'
-        f"{cells}</table>"
+        f'style="width:100%;border-collapse:collapse;">{cells}</table>'
     )
 
 
@@ -605,14 +781,17 @@ def render_email_bullets(items: List[str]) -> str:
     )
 
 
-def render_email_call_block(title: str, subtitle: str, calls: List[Dict[str, Any]]) -> str:
+def render_email_call_block(
+    title: str, subtitle: str, calls: List[Dict[str, Any]]
+) -> str:
     content = (
-        f'<div style="font-family:Arial,sans-serif;font-size:14px;line-height:20px;color:#6b7280;">{esc(subtitle)}</div>'
+        f'<div style="font-family:Arial,sans-serif;font-size:14px;line-height:20px;'
+        f'color:#6b7280;">{esc(subtitle)}</div>'
     )
     if not calls:
         content += (
-            '<div style="padding:12px 0 0 0;font-family:Arial,sans-serif;font-size:14px;line-height:20px;'
-            'color:#6b7280;">No calls to highlight.</div>'
+            '<div style="padding:12px 0 0 0;font-family:Arial,sans-serif;font-size:14px;'
+            'line-height:20px;color:#6b7280;">No calls to highlight.</div>'
         )
     else:
         for row in calls:
@@ -631,8 +810,8 @@ def render_email_call_block(title: str, subtitle: str, calls: List[Dict[str, Any
                 f"{esc(row['summary'] or row['explanation_of_outcome'] or '—')}</td></tr>"
                 '<tr><td style="padding:0 12px 12px 12px;font-family:Arial,sans-serif;font-size:12px;'
                 'line-height:18px;color:#6b7280;">'
-                f"Scheduled: <b>{esc(row['did_schedule'])}</b> &nbsp; | &nbsp; "
-                f"Score: <b>{esc(fmt_pct(row['score']))}</b> &nbsp; | &nbsp; "
+                f"Scheduled: <b>{esc(row['did_schedule'])}</b> &nbsp;|&nbsp; "
+                f"Score: <b>{esc(fmt_pct(row['score']))}</b> &nbsp;|&nbsp; "
                 f"Talk: <b>{esc(fmt_sec(row['talk_time']))}</b></td></tr>"
                 "</table>"
             )
@@ -642,150 +821,81 @@ def render_email_call_block(title: str, subtitle: str, calls: List[Dict[str, Any
         'style="width:100%;border-collapse:separate;background:#fdfaf4;border:1px solid #ddd5c7;'
         'border-radius:12px;">'
         '<tr><td style="padding:12px;">'
-        f'<div style="font-family:Arial,sans-serif;font-size:18px;line-height:22px;font-weight:700;color:#1f2937;">{esc(title)}</div>'
+        f'<div style="font-family:Arial,sans-serif;font-size:18px;line-height:22px;'
+        f'font-weight:700;color:#1f2937;">{esc(title)}</div>'
         f'<div style="padding-top:4px;">{content}</div>'
         "</td></tr></table>"
     )
 
 
 def render_brand_block(logo_url: str) -> str:
-    if safe_str(logo_url):
-        return (
-            '<table role="presentation" cellpadding="0" cellspacing="0" border="0" style="border-collapse:collapse;">'
-            '<tr>'
-            f'<td valign="middle" style="padding-right:10px;"><img src="{esc(logo_url)}" alt="CTM Daily Executive Summary" width="44" '
-            'style="display:block;border:0;outline:none;text-decoration:none;width:44px;height:auto;"></td>'
-            '<td valign="middle" style="font-family:Arial,sans-serif;">'
-            '<div style="font-size:11px;line-height:14px;font-weight:700;color:#bae6fd;text-transform:uppercase;letter-spacing:0.08em;">Call Tracking Metrics</div>'
-            '<div style="font-size:18px;line-height:22px;font-weight:700;color:#ffffff;">Daily Executive Summary</div>'
-            '</td>'
-            '</tr>'
-            '</table>'
-        )
-
-    return (
-        '<table role="presentation" cellpadding="0" cellspacing="0" border="0" style="border-collapse:collapse;">'
-        '<tr>'
-        '<td valign="middle" style="padding-right:10px;">'
+    logomark_fallback = (
         '<table role="presentation" width="44" height="44" cellpadding="0" cellspacing="0" border="0" '
         'style="width:44px;height:44px;border-collapse:collapse;background:#1f5d8b;">'
-        '<tr><td width="22" height="22" style="background:#36b6f4;border-right:2px solid #f2f6fb;border-bottom:2px solid #f2f6fb;"></td>'
-        '<td width="22" height="22" style="background:#1f5d8b;border-bottom:2px solid #f2f6fb;"></td></tr>'
-        '<tr><td width="22" height="22" style="background:#f2f6fb;border-right:2px solid #f2f6fb;"></td>'
-        '<td width="22" height="22" style="background:#1e2a55;"></td></tr>'
-        '</table>'
-        '</td>'
-        '<td valign="middle" style="font-family:Arial,sans-serif;">'
-        '<div style="font-size:11px;line-height:14px;font-weight:700;color:#bae6fd;text-transform:uppercase;letter-spacing:0.08em;">Call Tracking Metrics</div>'
-        '<div style="font-size:18px;line-height:22px;font-weight:700;color:#ffffff;">Daily Executive Summary</div>'
-        '</td>'
+        '<tr>'
+        '<td width="22" height="22" style="background:#36b6f4;border-right:2px solid #f2f6fb;border-bottom:2px solid #f2f6fb;"></td>'
+        '<td width="22" height="22" style="background:#1f5d8b;border-bottom:2px solid #f2f6fb;"></td>'
+        '</tr>'
+        '<tr>'
+        '<td width="22" height="22" style="background:#f2f6fb;border-right:2px solid #f2f6fb;"></td>'
+        '<td width="22" height="22" style="background:#1e2a55;"></td>'
         '</tr>'
         '</table>'
     )
+    logo_img = (
+        f'<img src="{esc(logo_url)}" alt="CTM" width="44" '
+        'style="display:block;border:0;outline:none;text-decoration:none;width:44px;height:auto;">'
+        if safe_str(logo_url) else logomark_fallback
+    )
+    wordmark = (
+        '<div style="font-size:11px;line-height:14px;font-weight:700;color:#bae6fd;'
+        'text-transform:uppercase;letter-spacing:0.08em;">Call Tracking Metrics</div>'
+        '<div style="font-size:18px;line-height:22px;font-weight:700;color:#ffffff;">'
+        'Daily Executive Summary</div>'
+    )
+    return (
+        '<table role="presentation" cellpadding="0" cellspacing="0" border="0" '
+        'style="border-collapse:collapse;"><tr>'
+        f'<td valign="middle" style="padding-right:10px;">{logo_img}</td>'
+        f'<td valign="middle" style="font-family:Arial,sans-serif;">{wordmark}</td>'
+        '</tr></table>'
+    )
 
 
-def build_exec_bullets(overview: Dict[str, Any], agent_rows: List[Dict[str, Any]], source_rows: List[Dict[str, Any]]) -> List[str]:
-    bullets: List[str] = []
-    if overview["inbound_calls"] or overview["total_calls"]:
-        bullets.append(
-            f"{overview['inbound_calls']} inbound leads generated {overview['scheduled_calls']} booked calls, a {fmt_pct(overview['scheduled_rate'])} booking rate."
-        )
-    if source_rows:
-        top_source = source_rows[0]
-        bullets.append(
-            f"{top_source['source']} led volume with {top_source['calls']} calls and converted at {fmt_pct(top_source['scheduled_rate'])}."
-        )
-    if agent_rows:
-        best_agent = sorted(
-            agent_rows,
-            key=lambda row: (row["scheduled_calls"], row["scheduled_rate"], row["calls"], row["avg_score"] or 0),
-            reverse=True,
-        )[0]
-        bullets.append(
-            f"{best_agent['agent_name']} led the team with {best_agent['scheduled_calls']} booked calls on {best_agent['calls']} conversations."
-        )
-    return bullets[:3]
+# ---------------------------------------------------------------------------
+# Full HTML report
+# ---------------------------------------------------------------------------
 
 
-def build_team_coaching_insights(agent_rows: List[Dict[str, Any]], overview: Dict[str, Any]) -> Dict[str, Any]:
-    missed_counter: Counter = Counter()
-    objection_counter: Counter = Counter()
-    outcome_counter: Counter = Counter()
-    for row in agent_rows:
-        missed_counter.update(row["missed_counter"])
-        objection_counter.update(row["objection_counter"])
-        outcome_counter.update(row["outcome_counter"])
-
-    return {
-        "top_missed": missed_counter,
-        "top_objections": objection_counter,
-        "top_outcomes": outcome_counter or overview["top_outcomes"],
-    }
-
-
-def build_notable_calls(records: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
-    summarized = [row for row in records if row["summary"]]
-    best_calls = sorted(
-        [row for row in summarized if row["did_schedule"] == "Yes"],
-        key=lambda row: (row["score"] or 0, row["talk_time"], row["unix_time"]),
-        reverse=True,
-    )[:3]
-    missed_calls = sorted(
-        [
-            row
-            for row in summarized
-            if row["did_schedule"] != "Yes" and (row["objection"] not in {"None", "Unknown", ""} or row["missed_questions"])
-        ],
-        key=lambda row: (row["talk_time"], -(row["score"] or 0), row["unix_time"]),
-        reverse=True,
-    )[:3]
-    recent_calls = summarized[:8]
-    return {
-        "best_calls": best_calls,
-        "missed_calls": missed_calls,
-        "recent_calls": recent_calls,
-    }
-
-
-def generate_html_report(dashboard: Dict[str, Any], max_detail_rows: int = 75, logo_url: str = "") -> str:
+def generate_html_report(
+    dashboard: Dict[str, Any],
+    max_detail_rows: int = DEFAULT_MAX_DETAIL_ROWS,
+    logo_url: str = "",
+) -> str:
     overview = dashboard["overview"]
     agent_rows = dashboard["agent_breakdown"]
     source_rows = dashboard["source_breakdown"]
     team_insights = build_team_coaching_insights(agent_rows, overview)
     exec_bullets = build_exec_bullets(overview, agent_rows, source_rows)
     notable_calls = build_notable_calls(dashboard["call_details"])
-    summarized_detail_rows = [
-        row for row in dashboard["call_details"] if safe_str(row.get("summary"))
-    ]
-    detail_rows = summarized_detail_rows[:max_detail_rows]
+
     sorted_agent_rows = sorted(
         agent_rows,
-        key=lambda row: (row["scheduled_calls"], row["scheduled_rate"], row["calls"], row["avg_score"] or 0),
+        key=lambda r: (r["scheduled_calls"], r["scheduled_rate"], r["calls"], r["avg_score"] or 0),
         reverse=True,
     )
-
-    top_agent = "—"
-    if sorted_agent_rows:
-        top_agent = sorted_agent_rows[0]["agent_name"]
-
+    top_agent = sorted_agent_rows[0]["agent_name"] if sorted_agent_rows else "—"
     top_source = source_rows[0]["source"] if source_rows else "—"
 
-    trend_rows = [
-        row
-        for row in agent_rows
-        if row["service_counter"] or row["outcome_counter"] or row["missed_counter"] or row["objection_counter"]
-    ]
+    detail_rows = [
+        r for r in dashboard["call_details"] if safe_str(r.get("summary"))
+    ][:max_detail_rows]
 
-    exec_snapshot = render_email_bullets(exec_bullets)
-    coaching_snapshot = render_email_table(
-        ["Teamwide Focus", "Most Common"],
-        [
-            ["Missed questions", esc(top_items(team_insights["top_missed"], 6))],
-            ["Objections", esc(top_items(team_insights["top_objections"], 6))],
-            ["Outcomes", esc(top_items(team_insights["top_outcomes"], 6))],
-        ],
-        ["28%", "72%"],
-    )
+    trend_rows = [
+        r for r in agent_rows
+        if r["service_counter"] or r["outcome_counter"]
+        or r["missed_counter"] or r["objection_counter"]
+    ]
 
     kpi_html = render_email_kpis(
         [
@@ -799,496 +909,401 @@ def generate_html_report(dashboard: Dict[str, Any], max_detail_rows: int = 75, l
     )
 
     agent_table = render_email_table(
-        [
-            "Agent",
-            "Handled",
-            "Booked",
-            "Booked Rate",
-            "Answered Rate",
-            "Avg Score",
-            "Primary Source",
-            "Coaching Focus",
-        ],
+        ["Agent", "Handled", "Booked", "Booked Rate", "Answered Rate",
+         "Avg Score", "Primary Source", "Coaching Focus"],
         [
             [
-                esc(row["agent_name"]),
-                esc(row["calls"]),
-                esc(row["scheduled_calls"]),
-                esc(fmt_pct(row["scheduled_rate"])),
-                esc(fmt_pct(row["answered_rate"])),
-                esc(fmt_pct(row["avg_score"])),
-                esc(row["top_source"]),
-                esc(top_items(row["missed_counter"], 2) if row["missed_counter"] else top_items(row["objection_counter"], 2)),
+                esc(r["agent_name"]), esc(r["calls"]), esc(r["scheduled_calls"]),
+                esc(fmt_pct(r["scheduled_rate"])), esc(fmt_pct(r["answered_rate"])),
+                esc(fmt_pct(r["avg_score"])), esc(r["top_source"]),
+                esc(top_items(r["missed_counter"], 2) if r["missed_counter"]
+                    else top_items(r["objection_counter"], 2)),
             ]
-            for row in sorted_agent_rows
+            for r in sorted_agent_rows
         ],
         ["19%", "9%", "9%", "11%", "11%", "10%", "15%", "16%"],
     )
 
     source_table = render_email_table(
-        [
-            "Source",
-            "Lead Volume",
-            "Booked",
-            "Booked Rate",
-            "Answered Rate",
-            "Avg Score",
-            "Top Agent",
-            "Top Outcome",
-        ],
+        ["Source", "Lead Volume", "Booked", "Booked Rate", "Answered Rate",
+         "Avg Score", "Top Agent", "Top Outcome"],
         [
             [
-                esc(row["source"]),
-                esc(row["calls"]),
-                esc(row["scheduled_calls"]),
-                esc(fmt_pct(row["scheduled_rate"])),
-                esc(fmt_pct(row["answered_rate"])),
-                esc(fmt_pct(row["avg_score"])),
-                esc(row["top_agent"]),
-                esc(row["top_outcome"]),
+                esc(r["source"]), esc(r["calls"]), esc(r["scheduled_calls"]),
+                esc(fmt_pct(r["scheduled_rate"])), esc(fmt_pct(r["answered_rate"])),
+                esc(fmt_pct(r["avg_score"])), esc(r["top_agent"]), esc(r["top_outcome"]),
             ]
-            for row in source_rows
+            for r in source_rows
         ],
         ["22%", "10%", "9%", "11%", "11%", "10%", "14%", "13%"],
+    )
+
+    coaching_table = render_email_table(
+        ["Teamwide Focus", "Most Common"],
+        [
+            ["Missed questions", esc(top_items(team_insights["top_missed"], 6))],
+            ["Objections",       esc(top_items(team_insights["top_objections"], 6))],
+            ["Outcomes",         esc(top_items(team_insights["top_outcomes"], 6))],
+        ],
+        ["28%", "72%"],
     )
 
     trends_table = render_email_table(
         ["Agent", "Service Mix", "Outcomes", "Missed Questions", "Objections"],
         [
             [
-                esc(row["agent_name"]),
-                esc(top_items(row["service_counter"], 4)),
-                esc(top_items(row["outcome_counter"], 4)),
-                esc(top_items(row["missed_counter"], 4)),
-                esc(top_items(row["objection_counter"], 4)),
+                esc(r["agent_name"]),
+                esc(top_items(r["service_counter"], 4)),
+                esc(top_items(r["outcome_counter"], 4)),
+                esc(top_items(r["missed_counter"], 4)),
+                esc(top_items(r["objection_counter"], 4)),
             ]
-            for row in trend_rows
+            for r in trend_rows
         ],
         ["18%", "20%", "20%", "24%", "18%"],
     )
 
     detail_table = render_email_table(
-        [
-            "Called At",
-            "Agent",
-            "Source",
-            "Status",
-            "Service",
-            "Outcome",
-            "Scheduled",
-            "Score",
-            "Summary",
-        ],
+        ["Called At", "Agent", "Source", "Status", "Service",
+         "Outcome", "Scheduled", "Score", "Summary"],
         [
             [
-                esc(row["called_at"]),
-                esc(row["agent_name"]),
-                esc(row["source"]),
-                esc(row["dial_status"] or row["status"]),
-                esc(row["service_type"]),
-                esc(row["call_outcome"]),
-                esc(row["did_schedule"]),
-                esc(fmt_pct(row["score"])),
-                esc(row["summary"] or row["explanation_of_outcome"] or "—"),
+                esc(r["called_at"]), esc(r["agent_name"]), esc(r["source"]),
+                esc(r["dial_status"] or r["status"]), esc(r["service_type"]),
+                esc(r["call_outcome"]), esc(r["did_schedule"]),
+                esc(fmt_pct(r["score"])),
+                esc(r["summary"] or r["explanation_of_outcome"] or "—"),
             ]
-            for row in detail_rows
+            for r in detail_rows
         ],
         ["14%", "10%", "12%", "8%", "9%", "10%", "8%", "7%", "22%"],
     )
 
-    notable_html = (
-        f"{render_email_call_block('Booked Wins', '', notable_calls['best_calls'])}"
-        '<div style="height:6px;line-height:6px;font-size:6px;">&nbsp;</div>'
-        f"{render_email_call_block('Missed Opportunities', '', notable_calls['missed_calls'])}"
+    no_trends_html = (
+        '<div style="font-family:Arial,sans-serif;font-size:14px;line-height:20px;'
+        'color:#6b7280;">No agent trends available.</div>'
     )
 
-    no_agent_trends_html = (
-        '<div style="font-family:Arial,sans-serif;font-size:14px;line-height:20px;color:#6b7280;">No agent trends available.</div>'
-    )
+    def section(title: str, body: str) -> str:
+        return (
+            '<tr><td style="padding:2px 6px;">'
+            '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" '
+            'style="background:#fdfaf4;border:1px solid #ddd5c7;border-collapse:separate;">'
+            f'<tr><td style="padding:10px 10px 4px 10px;font-family:Arial,sans-serif;'
+            f'font-size:18px;line-height:22px;font-weight:700;color:#1f2937;">{esc(title)}</td></tr>'
+            f'<tr><td style="padding:0 10px 8px 10px;">{body}</td></tr>'
+            "</table></td></tr>"
+        )
+
     brand_block = render_brand_block(logo_url)
+    exec_snapshot = render_email_bullets(exec_bullets)
+    notable_html = (
+        render_email_call_block("Booked Wins", "", notable_calls["best_calls"])
+        + '<div style="height:6px;line-height:6px;font-size:6px;">&nbsp;</div>'
+        + render_email_call_block("Missed Opportunities", "", notable_calls["missed_calls"])
+    )
 
     return f"""<!DOCTYPE html>
 <html lang="en" xmlns="http://www.w3.org/1999/xhtml">
 <body style="margin:0;padding:0;background-color:#ffffff;">
-  <div style="display:none;max-height:0;overflow:hidden;opacity:0;color:transparent;">
-    Daily CTM summary with bookings, agent scorecard, source scorecard, coaching insights, and notable calls.
-  </div>
-  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="width:100%;background-color:#ffffff;margin:0;padding:0;">
-    <tr>
-      <td align="left" style="padding:0;">
-        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="width:100%;border-collapse:collapse;background-color:#fcf8f1;">
-          <tr>
-            <td style="padding:0;background-color:#1f5d8b;border-bottom:4px solid #36b6f4;">
-              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="width:100%;border-collapse:collapse;">
-                <tr>
-                  <td valign="middle" align="left" style="padding:8px 10px 8px 10px;">
-                    {brand_block}
-                    <div style="padding-top:4px;font-family:Arial,sans-serif;font-size:12px;line-height:16px;color:#d9edf7;">
-                      {esc(dashboard['report_label'])}
-                    </div>
-                  </td>
-                  <td valign="middle" align="right" style="padding:8px 10px 8px 0;font-family:Arial,sans-serif;white-space:nowrap;">
-                    <span style="display:inline-block;padding:6px 8px;background-color:#eff8f7;border:1px solid #b9d7d1;font-size:11px;line-height:14px;font-weight:700;color:#0f766e;">
-                      Generated {esc(dashboard['generated_at'])}
-                    </span>
-                  </td>
-                </tr>
-              </table>
-            </td>
-          </tr>
+<div style="display:none;max-height:0;overflow:hidden;opacity:0;color:transparent;">
+Daily CTM summary: bookings, agent scorecard, source scorecard, coaching insights, and notable calls.
+</div>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"
+  style="width:100%;background-color:#ffffff;margin:0;padding:0;">
+<tr><td align="left" style="padding:0;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"
+  style="width:100%;border-collapse:collapse;background-color:#fcf8f1;">
 
-          <tr>
-            <td style="padding:2px 6px 0 6px;">{kpi_html}</td>
-          </tr>
+<!-- Header -->
+<tr><td style="padding:0;background-color:#1f5d8b;border-bottom:4px solid #36b6f4;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"
+  style="width:100%;border-collapse:collapse;">
+<tr>
+  <td valign="middle" align="left" style="padding:8px 10px;">
+    {brand_block}
+    <div style="padding-top:4px;font-family:Arial,sans-serif;font-size:12px;line-height:16px;color:#d9edf7;">
+      {esc(dashboard['report_label'])}
+    </div>
+  </td>
+  <td valign="middle" align="right" style="padding:8px 10px 8px 0;font-family:Arial,sans-serif;white-space:nowrap;">
+    <span style="display:inline-block;padding:6px 8px;background-color:#eff8f7;border:1px solid #b9d7d1;
+      font-size:11px;line-height:14px;font-weight:700;color:#0f766e;">
+      Generated {esc(dashboard['generated_at'])}
+    </span>
+  </td>
+</tr>
+</table>
+</td></tr>
 
-          <tr>
-            <td style="padding:2px 6px 2px 6px;">
-              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#fdfaf4;border:1px solid #ddd5c7;border-collapse:separate;">
-                <tr><td style="padding:10px 10px 2px 10px;font-family:Arial,sans-serif;font-size:18px;line-height:22px;font-weight:700;color:#1f2937;">Executive Snapshot</td></tr>
-                <tr><td style="padding:0 10px 2px 10px;">{exec_snapshot}</td></tr>
-                <tr><td style="padding:0 10px 10px 10px;font-family:Arial,sans-serif;font-size:13px;line-height:19px;color:#4b5563;">
-                  Summarized conversations: <b>{esc(overview['summarized_calls'])}</b> &nbsp; | &nbsp;
-                  New callers: <b>{esc(overview['new_callers'])}</b> &nbsp; | &nbsp;
-                  Inbound / Outbound: <b>{esc(overview['inbound_calls'])} / {esc(overview['outbound_calls'])}</b> &nbsp; | &nbsp;
-                  Avg ring / hold / wait: <b>{esc(fmt_sec(overview['avg_ring_time']))} / {esc(fmt_sec(overview['avg_hold_time']))} / {esc(fmt_sec(overview['avg_wait_time']))}</b>
-                </td></tr>
-              </table>
-            </td>
-          </tr>
+<!-- KPIs -->
+<tr><td style="padding:2px 6px 0 6px;">{kpi_html}</td></tr>
 
-          <tr><td style="padding:2px 6px;">
-            <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#fdfaf4;border:1px solid #ddd5c7;border-collapse:separate;">
-              <tr><td style="padding:10px 10px 4px 10px;font-family:Arial,sans-serif;font-size:18px;line-height:22px;font-weight:700;color:#1f2937;">Agent Scorecard</td></tr>
-              <tr><td style="padding:0 10px 8px 10px;">{agent_table}</td></tr>
-            </table>
-          </td></tr>
+<!-- Executive Snapshot -->
+<tr><td style="padding:2px 6px;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"
+  style="background:#fdfaf4;border:1px solid #ddd5c7;border-collapse:separate;">
+<tr><td style="padding:10px 10px 2px 10px;font-family:Arial,sans-serif;font-size:18px;
+  line-height:22px;font-weight:700;color:#1f2937;">Executive Snapshot</td></tr>
+<tr><td style="padding:0 10px 2px 10px;">{exec_snapshot}</td></tr>
+<tr><td style="padding:0 10px 10px 10px;font-family:Arial,sans-serif;font-size:13px;
+  line-height:19px;color:#4b5563;">
+  Summarized: <b>{esc(overview['summarized_calls'])}</b> &nbsp;|&nbsp;
+  New callers: <b>{esc(overview['new_callers'])}</b> &nbsp;|&nbsp;
+  Inbound / Outbound: <b>{esc(overview['inbound_calls'])} / {esc(overview['outbound_calls'])}</b> &nbsp;|&nbsp;
+  Avg ring / hold / wait: <b>{esc(fmt_sec(overview['avg_ring_time']))} /
+    {esc(fmt_sec(overview['avg_hold_time']))} / {esc(fmt_sec(overview['avg_wait_time']))}</b>
+</td></tr>
+</table>
+</td></tr>
 
-          <tr><td style="padding:2px 6px;">
-            <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#fdfaf4;border:1px solid #ddd5c7;border-collapse:separate;">
-              <tr><td style="padding:10px 10px 4px 10px;font-family:Arial,sans-serif;font-size:18px;line-height:22px;font-weight:700;color:#1f2937;">Source Scorecard</td></tr>
-              <tr><td style="padding:0 10px 8px 10px;">{source_table}</td></tr>
-            </table>
-          </td></tr>
+{section("Agent Scorecard", agent_table)}
+{section("Source Scorecard", source_table)}
+{section("Team Coaching Insights", coaching_table)}
+{section("AI Trends By Agent", trends_table if trend_rows else no_trends_html)}
+{section("Notable Summarized Calls", notable_html)}
+{section("Recent Summarized Call Detail", detail_table)}
 
-          <tr><td style="padding:2px 6px;">
-            <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#fdfaf4;border:1px solid #ddd5c7;border-collapse:separate;">
-              <tr><td style="padding:10px 10px 4px 10px;font-family:Arial,sans-serif;font-size:18px;line-height:22px;font-weight:700;color:#1f2937;">Team Coaching Insights</td></tr>
-              <tr><td style="padding:0 10px 8px 10px;">{coaching_snapshot}</td></tr>
-            </table>
-          </td></tr>
-
-          <tr><td style="padding:2px 6px;">
-            <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#fdfaf4;border:1px solid #ddd5c7;border-collapse:separate;">
-              <tr><td style="padding:10px 10px 4px 10px;font-family:Arial,sans-serif;font-size:18px;line-height:22px;font-weight:700;color:#1f2937;">AI Trends By Agent</td></tr>
-              <tr><td style="padding:0 10px 8px 10px;">{trends_table if trend_rows else no_agent_trends_html}</td></tr>
-            </table>
-          </td></tr>
-
-          <tr><td style="padding:2px 6px;">
-            <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#fdfaf4;border:1px solid #ddd5c7;border-collapse:separate;">
-              <tr><td style="padding:10px 10px 4px 10px;font-family:Arial,sans-serif;font-size:18px;line-height:22px;font-weight:700;color:#1f2937;">Notable Summarized Calls</td></tr>
-              <tr><td style="padding:0 10px 8px 10px;">{notable_html}</td></tr>
-            </table>
-          </td></tr>
-
-          <tr><td style="padding:2px 6px 6px 6px;">
-            <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#fdfaf4;border:1px solid #ddd5c7;border-collapse:separate;">
-              <tr><td style="padding:10px 10px 4px 10px;font-family:Arial,sans-serif;font-size:18px;line-height:22px;font-weight:700;color:#1f2937;">Recent Summarized Call Detail</td></tr>
-              <tr><td style="padding:0 10px 8px 10px;">{detail_table}</td></tr>
-            </table>
-          </td></tr>
-        </table>
-      </td>
-    </tr>
-  </table>
+</table>
+</td></tr>
+</table>
 </body>
 </html>"""
 
 
-def write_json(path: Path, payload: Dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2)
+# ---------------------------------------------------------------------------
+# CSV / JSON exports
+# ---------------------------------------------------------------------------
 
 
-def write_csv(path: Path, rows: List[Dict[str, Any]], fieldnames: List[str]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+def export_csv(
+    rows: List[Dict[str, Any]],
+    path: Path,
+    fields: List[str],
+) -> None:
+    with path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
-        for row in rows:
-            writer.writerow({name: row.get(name) for name in fieldnames})
+        writer.writerows(rows)
+    log.info("Wrote %s", path)
 
 
-def export_files(dashboard: Dict[str, Any], html_report: str, out_dir: Path, slug: str) -> Dict[str, Path]:
-    out_dir.mkdir(parents=True, exist_ok=True)
+def export_all(dashboard: Dict[str, Any], date_str: str) -> None:
+    call_fields = [
+        "id", "called_at", "agent_name", "source", "direction", "status",
+        "dial_status", "service_type", "call_outcome", "did_schedule",
+        "score", "talk_time", "ring_time", "hold_time", "wait_time_s",
+        "is_new_caller", "objection", "missed_questions_text",
+        "summary", "explanation_of_outcome", "city", "state",
+    ]
+    agent_fields = [
+        "agent_name", "calls", "inbound_calls", "answered_calls", "answered_rate",
+        "scheduled_calls", "scheduled_rate", "avg_score", "avg_talk_time",
+        "avg_ring_time", "avg_hold_time", "avg_wait_time",
+        "top_source", "top_outcome", "top_service",
+    ]
+    source_fields = [
+        "source", "calls", "inbound_calls", "answered_calls", "answered_rate",
+        "scheduled_calls", "scheduled_rate", "avg_score", "avg_talk_time",
+        "top_agent", "top_outcome",
+    ]
+    matrix_fields = [
+        "agent_name", "source", "calls", "inbound_calls",
+        "scheduled_calls", "scheduled_rate", "avg_score",
+    ]
 
-    html_path = out_dir / f"ctm_daily_executive_summary_{slug}.html"
-    json_path = out_dir / f"ctm_daily_executive_summary_{slug}.json"
-    calls_csv_path = out_dir / f"ctm_daily_calls_{slug}.csv"
-    agent_csv_path = out_dir / f"ctm_daily_agents_{slug}.csv"
-    source_csv_path = out_dir / f"ctm_daily_sources_{slug}.csv"
-    matrix_csv_path = out_dir / f"ctm_daily_agent_source_{slug}.csv"
+    export_csv(dashboard["call_details"],        Path(f"ctm_calls_{date_str}.csv"),         call_fields)
+    export_csv(dashboard["agent_breakdown"],      Path(f"ctm_agents_{date_str}.csv"),        agent_fields)
+    export_csv(dashboard["source_breakdown"],     Path(f"ctm_sources_{date_str}.csv"),       source_fields)
+    export_csv(dashboard["agent_source_breakdown"], Path(f"ctm_agent_sources_{date_str}.csv"), matrix_fields)
 
-    html_path.write_text(html_report, encoding="utf-8")
-    write_json(json_path, dashboard)
-
-    write_csv(
-        calls_csv_path,
-        dashboard["call_details"],
-        [
-            "id",
-            "called_at",
-            "agent_name",
-            "agent_email",
-            "source",
-            "direction",
-            "status",
-            "dial_status",
-            "duration",
-            "talk_time",
-            "ring_time",
-            "hold_time",
-            "wait_time_s",
-            "service_type",
-            "call_outcome",
-            "did_schedule",
-            "objection",
-            "missed_questions_text",
-            "score",
-            "rating",
-            "summary",
-            "explanation_of_outcome",
-            "tracking_label",
-            "caller_name",
-            "city",
-            "state",
-        ],
-    )
-
-    write_csv(
-        agent_csv_path,
-        [
-            {
-                "agent_name": row["agent_name"],
-                "calls": row["calls"],
-                "answered_calls": row["answered_calls"],
-                "answered_rate": round(row["answered_rate"], 2),
-                "scheduled_calls": row["scheduled_calls"],
-                "scheduled_rate": round(row["scheduled_rate"], 2),
-                "avg_score": round(row["avg_score"], 2) if row["avg_score"] is not None else "",
-                "avg_talk_time": round(row["avg_talk_time"], 2),
-                "avg_ring_time": round(row["avg_ring_time"], 2),
-                "avg_hold_time": round(row["avg_hold_time"], 2),
-                "avg_wait_time": round(row["avg_wait_time"], 2),
-                "top_source": row["top_source"],
-                "top_outcome": row["top_outcome"],
-                "top_service": row["top_service"],
-                "missed_questions": top_items(row["missed_counter"], 6),
-                "objections": top_items(row["objection_counter"], 6),
-            }
-            for row in dashboard["agent_breakdown"]
-        ],
-        [
-            "agent_name",
-            "calls",
-            "answered_calls",
-            "answered_rate",
-            "scheduled_calls",
-            "scheduled_rate",
-            "avg_score",
-            "avg_talk_time",
-            "avg_ring_time",
-            "avg_hold_time",
-            "avg_wait_time",
-            "top_source",
-            "top_outcome",
-            "top_service",
-            "missed_questions",
-            "objections",
-        ],
-    )
-
-    write_csv(
-        source_csv_path,
-        [
-            {
-                "source": row["source"],
-                "calls": row["calls"],
-                "answered_calls": row["answered_calls"],
-                "answered_rate": round(row["answered_rate"], 2),
-                "scheduled_calls": row["scheduled_calls"],
-                "scheduled_rate": round(row["scheduled_rate"], 2),
-                "avg_score": round(row["avg_score"], 2) if row["avg_score"] is not None else "",
-                "avg_talk_time": round(row["avg_talk_time"], 2),
-                "top_agent": row["top_agent"],
-                "top_outcome": row["top_outcome"],
-            }
-            for row in dashboard["source_breakdown"]
-        ],
-        [
-            "source",
-            "calls",
-            "answered_calls",
-            "answered_rate",
-            "scheduled_calls",
-            "scheduled_rate",
-            "avg_score",
-            "avg_talk_time",
-            "top_agent",
-            "top_outcome",
-        ],
-    )
-
-    write_csv(
-        matrix_csv_path,
-        [
-            {
-                "agent_name": row["agent_name"],
-                "source": row["source"],
-                "calls": row["calls"],
-                "scheduled_calls": row["scheduled_calls"],
-                "scheduled_rate": round(row["scheduled_rate"], 2),
-                "avg_score": round(row["avg_score"], 2) if row["avg_score"] is not None else "",
-            }
-            for row in dashboard["agent_source_breakdown"]
-        ],
-        [
-            "agent_name",
-            "source",
-            "calls",
-            "scheduled_calls",
-            "scheduled_rate",
-            "avg_score",
-        ],
-    )
-
-    return {
-        "html": html_path,
-        "json": json_path,
-        "calls_csv": calls_csv_path,
-        "agents_csv": agent_csv_path,
-        "sources_csv": source_csv_path,
-        "agent_source_csv": matrix_csv_path,
-    }
+    export_json(dashboard, date_str)
 
 
-def sanitize_for_json(payload: Dict[str, Any]) -> Dict[str, Any]:
-    safe_payload = json.loads(json.dumps(payload, default=str))
-    for row in safe_payload.get("agent_breakdown", []):
-        for key in ["source_counter", "outcome_counter", "service_counter", "objection_counter", "missed_counter"]:
-            if key in row:
-                row[key] = dict(row[key])
-    for row in safe_payload.get("source_breakdown", []):
-        if "agent_counter" in row:
-            row["agent_counter"] = dict(row["agent_counter"])
-    if "overview" in safe_payload and "top_outcomes" in safe_payload["overview"]:
-        safe_payload["overview"]["top_outcomes"] = dict(safe_payload["overview"]["top_outcomes"])
-    return safe_payload
+def export_json(dashboard: Dict[str, Any], date_str: str) -> None:
+    json_path = Path(f"ctm_daily_summary_{date_str}.json")
+    # Counters aren't JSON-serialisable — convert before writing
+    serialisable = json.loads(json.dumps(dashboard, default=str))
+    json_path.write_text(json.dumps(serialisable, indent=2), encoding="utf-8")
+    log.info("Wrote %s", json_path)
 
 
-def post_to_webhook(webhook_url: str, html_report: str) -> None:
-    response = requests.post(
+def export_csvs(dashboard: Dict[str, Any], date_str: str) -> None:
+    call_fields = [
+        "id", "called_at", "agent_name", "source", "direction", "status",
+        "dial_status", "service_type", "call_outcome", "did_schedule",
+        "score", "talk_time", "ring_time", "hold_time", "wait_time_s",
+        "is_new_caller", "objection", "missed_questions_text",
+        "summary", "explanation_of_outcome", "city", "state",
+    ]
+    agent_fields = [
+        "agent_name", "calls", "inbound_calls", "answered_calls", "answered_rate",
+        "scheduled_calls", "scheduled_rate", "avg_score", "avg_talk_time",
+        "avg_ring_time", "avg_hold_time", "avg_wait_time",
+        "top_source", "top_outcome", "top_service",
+    ]
+    source_fields = [
+        "source", "calls", "inbound_calls", "answered_calls", "answered_rate",
+        "scheduled_calls", "scheduled_rate", "avg_score", "avg_talk_time",
+        "top_agent", "top_outcome",
+    ]
+    matrix_fields = [
+        "agent_name", "source", "calls", "inbound_calls",
+        "scheduled_calls", "scheduled_rate", "avg_score",
+    ]
+
+    export_csv(dashboard["call_details"],        Path(f"ctm_calls_{date_str}.csv"),         call_fields)
+    export_csv(dashboard["agent_breakdown"],      Path(f"ctm_agents_{date_str}.csv"),        agent_fields)
+    export_csv(dashboard["source_breakdown"],     Path(f"ctm_sources_{date_str}.csv"),       source_fields)
+    export_csv(dashboard["agent_source_breakdown"], Path(f"ctm_agent_sources_{date_str}.csv"), matrix_fields)
+
+
+# ---------------------------------------------------------------------------
+# Webhook delivery
+# ---------------------------------------------------------------------------
+
+
+def post_to_webhook(html_report: str, webhook_url: str, timeout: int = 30) -> None:
+    if not webhook_url:
+        log.warning("No webhook URL configured — skipping POST.")
+        return
+    log.info("Posting report to webhook...")
+    resp = requests.post(
         webhook_url,
-        headers={"Content-Type": "text/html; charset=utf-8"},
-        data=html_report.encode("utf-8"),
-        timeout=30,
+        json={"html": html_report},
+        timeout=timeout,
     )
-    response.raise_for_status()
+    resp.raise_for_status()
+    log.info("Webhook response: %s", resp.status_code)
 
 
-def resolve_auth_header(cli_auth_header: str = "", cli_api_key: str = "") -> str:
-    raw_auth = safe_str(cli_auth_header) or safe_str(os.getenv("CTM_AUTH")) or safe_str(os.getenv("CTM_BASIC_AUTH"))
-    api_key = (
-        safe_str(cli_api_key)
-        or safe_str(HARDCODED_CTM_API_KEY)
-        or safe_str(os.getenv("CTM_API_KEY"))
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="Generate and deliver a CTM daily executive summary report."
     )
-    if raw_auth:
-        return raw_auth
-    if api_key:
-        return f"Basic {api_key}"
-    raise RuntimeError(
-        "Missing CTM auth. Provide one of: "
-        "--auth-header 'Basic ...', --api-key '<base64 token>', "
-        "HARDCODED_CTM_API_KEY, CTM_AUTH, CTM_BASIC_AUTH, or CTM_API_KEY."
+    p.add_argument(
+        "--time-duration", default=DEFAULT_TIME_DURATION,
+        help="CTM time duration filter (default: %(default)s)",
     )
-
-
-def build_slug(time_duration: str) -> str:
-    stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    cleaned = re.sub(r"[^a-zA-Z0-9_-]+", "_", time_duration).strip("_").lower()
-    return f"{cleaned}_{stamp}"
+    p.add_argument(
+        "--no-hydrate-details", action="store_true",
+        help="Skip per-call detail API calls (faster, less data)",
+    )
+    p.add_argument(
+        "--no-webhook", action="store_true",
+        help="Write output files only; skip posting to Make.com",
+    )
+    p.add_argument(
+        "--max-detail-rows", type=int, default=DEFAULT_MAX_DETAIL_ROWS, metavar="N",
+        help="Max rows in the call detail table (default: %(default)s)",
+    )
+    p.add_argument(
+        "--sleep-s", type=float, default=DEFAULT_SLEEP_S, metavar="F",
+        help="Seconds to sleep between detail API calls (default: %(default)s)",
+    )
+    p.add_argument(
+        "--account-id", default=None,
+        help="CTM account ID (overrides CTM_ACCOUNT_ID env var)",
+    )
+    p.add_argument(
+        "--webhook-url", default=None,
+        help="Make.com webhook URL (overrides CTM_WEBHOOK_URL env var)",
+    )
+    p.add_argument(
+        "--logo-url", default=None,
+        help="Public URL of logo image (overrides CTM_LOGO_URL env var)",
+    )
+    p.add_argument(
+        "--converted-field", default=None,
+        help="Custom field key that indicates a conversion (overrides CTM_ONVERTED_FIELD)",
+    )
+    p.add_argument(
+        "--score-field", default=None,
+        help="Custom field key for AI score (overrides CTM_SCORE_FIELD)",
+    )
+    p.add_argument(
+        "--export-csv", action="store_true",
+        help="Write CSV exports (default: off)",
+    )
+    p.add_argument(
+        "--export-json", action="store_true",
+        help="Write JSON export (default: off)",
+    )
+    p.add_argument(
+        "--export-all", action="store_true",
+        help="Write CSV and JSON exports (default: off)",
+    )
+    return p
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build a daily CTM executive summary report.")
-    parser.add_argument("--account-id", default=ACCOUNT_ID)
-    parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
-    parser.add_argument("--auth-header", default="")
-    parser.add_argument("--api-key", default="")
-    parser.add_argument("--time-duration", default=os.getenv("CTM_TIME_DURATION", DEFAULT_TIME_DURATION))
-    parser.add_argument("--per-page", type=int, default=100)
-    parser.add_argument("--out-dir", default=str(Path.home() / "ctm_daily_reports"))
-    parser.add_argument("--webhook-url", default=os.getenv("WEBHOOK_URL", DEFAULT_WEBHOOK_URL))
-    parser.add_argument("--logo-url", default=os.getenv("CTM_LOGO_URL", DEFAULT_LOGO_URL))
-    parser.add_argument("--sleep", type=float, default=0.0, help="Sleep between detail calls.")
-    parser.add_argument("--max-detail-rows", type=int, default=75)
-    parser.add_argument("--print-html", action="store_true")
-    parser.add_argument("--no-hydrate-details", action="store_true", help="Skip per-call detail fetches.")
-    parser.add_argument("--no-webhook", action="store_true", help="Do not post the HTML report.")
+    args = _build_arg_parser().parse_args()
+    config = _resolve_config()
 
-    args = parser.parse_args()
+    account_id = args.account_id or config["CTM_ACCOUNT_ID"]
+    webhook_url = args.webhook_url or config["CTM_WEBHOOK_URL"]
+    logo_url = args.logo_url or config["CTM_LOGO_URL"]
+    converted_field = args.converted_field or config["CTM_ONVERTED_FIELD"] or "did_the_caller_schedule"
+    score_field = args.score_field or config["CTM_SCORE_FIELD"] or "cumulative_score_percentage"
 
-    if not safe_str(args.account_id):
-        raise RuntimeError("Missing account id. Set CTM_ACCOUNT_ID or pass --account-id.")
+    if not account_id:
+        raise SystemExit(
+            "CTM_ACCOUNT_ID not set. Set the env var, add it to ENV.txt, or pass --account-id."
+        )
 
-    auth_header = resolve_auth_header(args.auth_header, args.api_key)
+    auth_header = _resolve_auth_header()
     client = CTMClient(
-        account_id=args.account_id,
-        base_url=args.base_url,
+        account_id=account_id,
+        base_url=DEFAULT_BASE_URL,
         auth_header=auth_header,
     )
 
-    print(f"Fetching CTM calls for time_duration={args.time_duration}...")
-    calls = client.fetch_calls(time_duration=args.time_duration, per_page=args.per_page)
-    print(f"Fetched {len(calls)} calls from list endpoint.")
+    log.info("Fetching calls for time_duration=%s", args.time_duration)
+    raw_calls = client.fetch_calls(time_duration=args.time_duration)
+    log.info("Fetched %d calls total", len(raw_calls))
 
     calls = hydrate_calls(
         client=client,
-        calls=calls,
+        calls=raw_calls,
         hydrate_details=not args.no_hydrate_details,
-        sleep_s=args.sleep,
+        sleep_s=args.sleep_s,
     )
 
-    records = [extract_call_record(call) for call in calls]
-    report_label = f"Account {args.account_id} | time_duration={args.time_duration}"
-    dashboard = build_dashboard(records, report_label=report_label)
-    safe_dashboard = sanitize_for_json(dashboard)
+    records = [extract_call_record(c, converted_field=converted_field, score_field=score_field) for c in calls]
+    log.info("Normalized %d call records", len(records))
+
+    today = dt.date.today()
+    report_date = today - dt.timedelta(days=1) if args.time_duration == "yesterday" else today
+    date_str = report_date.strftime("%Y-%m-%d")
+    report_label = f"Report for {date_str}"
+
+    dashboard = build_dashboard(records, report_label)
     html_report = generate_html_report(
-        safe_dashboard,
+        dashboard,
         max_detail_rows=args.max_detail_rows,
-        logo_url=args.logo_url,
+        logo_url=logo_url,
     )
 
-    if args.print_html:
-        print(html_report)
+    html_path = Path(f"ctm_daily_summary_{date_str}.html")
+    html_path.write_text(html_report, encoding="utf-8")
+    log.info("Wrote %s", html_path)
 
-    slug = build_slug(args.time_duration)
-    paths = export_files(
-        dashboard=safe_dashboard,
-        html_report=html_report,
-        out_dir=Path(args.out_dir),
-        slug=slug,
-    )
+    if args.export_all or args.export_csv:
+        export_csvs(dashboard, date_str)
+    if args.export_all or args.export_json:
+        export_json(dashboard, date_str)
 
-    if not args.no_webhook and args.webhook_url:
-        post_to_webhook(args.webhook_url, html_report)
-        print("Webhook post succeeded.")
+    if not args.no_webhook:
+        post_to_webhook(html_report, webhook_url)
+    else:
+        log.info("--no-webhook set; skipping email delivery.")
 
-    print("Report outputs:")
-    for name, path in paths.items():
-        print(f"  {name}: {path}")
+    log.info("Done.")
 
 
 if __name__ == "__main__":

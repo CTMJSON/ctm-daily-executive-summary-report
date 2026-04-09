@@ -1,157 +1,195 @@
-# Daily CTM Executive Summary Report
+# CTM Daily Executive Summary
 
-Daily CallTrackingMetrics reporting script that:
+> A daily automated email report that turns yesterday's CTM call activity into a polished executive summary — agent scorecards, source performance, coaching insights, and notable call highlights, delivered to your inbox every morning.
 
-- fetches yesterday's CTM activities
-- follows CTM pagination
-- optionally hydrates each activity with the detail endpoint
-- aggregates operational and AI-derived metrics by agent and source
-- generates an email-safe HTML executive summary
-- posts the HTML to a Make.com webhook for downstream email delivery
+---
 
-The intended flow is:
+## What it does
 
-1. A scheduled worker runs the script once per day.
-2. The script fetches CTM activity data and builds the report.
-3. The script posts the HTML to a Make.com webhook.
-4. Make passes the HTML into a Gmail module to send the email.
+Every morning, this script fetches the previous day's calls from the CTM API, aggregates them into operational and AI-derived metrics, and delivers a complete HTML executive summary via Make.com + Gmail.
 
-This repo is generic. Replace the placeholders with your own CTM account, auth, webhook, and optional logo.
+The report includes:
+
+- **KPI bar** — inbound leads, answered rate, booking rate, avg AI score, top agent, top source
+- **Executive snapshot** — auto-generated narrative bullets summarizing the day
+- **Agent scorecard** — calls handled, booked rate, answered rate, avg AI score, coaching focus per agent
+- **Source scorecard** — lead volume, conversion, and agent coverage by tracking source
+- **Team coaching insights** — most-missed questions, top objections, outcome distribution
+- **AI trends by agent** — service mix, outcomes, missed questions, and objections broken down per agent
+- **Notable calls** — booked wins and missed opportunities surfaced from AI summaries
+- **Full call detail table** — every summarized call with outcome, score, and AI summary text
+
+---
+
+## How it works
+
+```
+CTM API  →  Python script  →  Make.com webhook  →  Gmail
+```
+
+1. A scheduled job runs the script once per day.
+2. The script fetches and aggregates the previous day's call data from CTM.
+3. It POSTs the finished HTML to a Make.com webhook.
+4. Make passes the HTML body to a Gmail module, which sends the email.
+
+The script also writes local HTML, JSON, and CSV exports each run for archiving or downstream use.
+
+---
 
 ## Requirements
 
+- Python 3.9+
 - CTM API access
-- Make.com scenario with:
-  - Custom Webhook module
-  - Gmail module
-- Gmail account connected to Make
-- A daily scheduler such as:
-  - PythonAnywhere scheduled task
-  - cron
-  - GitHub Actions
-  - another job runner
+- Make.com scenario with a Custom Webhook module and a Gmail module
+- A daily scheduler (cron, PythonAnywhere, GitHub Actions, etc.)
+
+---
 
 ## Install
 
 ```bash
 python3 -m venv .venv
-source .venv/bin/activate
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
+---
+
 ## Configuration
 
-Set these environment variables, or pass the equivalent CLI args:
+Set these environment variables (or pass the equivalent CLI flags):
 
 ```bash
-export CTM_ACCOUNT_ID="YOUR_ACCOUNT_ID"
-export CTM_API_KEY="YOUR_BASE64_CTM_BASIC_AUTH_TOKEN"
+export CTM_ACCOUNT_ID="your_account_id"
+export CTM_API_KEY="your_base64_ctm_basic_auth_token"
 export CTM_WEBHOOK_URL="https://hook.us1.make.com/your-webhook"
-export CTM_LOGO_URL="https://your-public-logo-url"
+export CTM_LOGO_URL="https://your-public-logo-url"   # optional
+export CTM_ONVERTED_FIELD="did_the_caller_schedule"  # optional (custom booked/converted field)
+export CTM_SCORE_FIELD="cumulative_score_percentage" # optional (custom AI score field)
 ```
 
-Notes:
+`CTM_API_KEY` is the base64 token sent as `Authorization: Basic <token>`.  
+`CTM_WEBHOOK_URL` is optional if you run with `--no-webhook`.  
+`CTM_LOGO_URL` is optional — a default CTM logomark block is rendered if omitted.
 
-- `CTM_API_KEY` should be the base64 CTM token that gets sent as `Authorization: Basic <token>`.
-- `CTM_WEBHOOK_URL` is optional if you run with `--no-webhook`.
-- `CTM_LOGO_URL` is optional.
+---
 
 ## Run
 
 ```bash
+# Standard daily run — fetches yesterday, posts to webhook
 python3 ctm_daily_executive_summary.py
-```
 
-Useful flags:
-
-```bash
+# Useful flags
 python3 ctm_daily_executive_summary.py --time-duration yesterday
-python3 ctm_daily_executive_summary.py --no-hydrate-details
-python3 ctm_daily_executive_summary.py --no-webhook
-python3 ctm_daily_executive_summary.py --max-detail-rows 25
+python3 ctm_daily_executive_summary.py --no-hydrate-details    # faster, skips per-call detail API calls
+python3 ctm_daily_executive_summary.py --no-webhook            # write files only, skip email
+python3 ctm_daily_executive_summary.py --max-detail-rows 25    # limit rows in the detail table
+python3 ctm_daily_executive_summary.py --export-all            # write CSV + JSON
+python3 ctm_daily_executive_summary.py --export-csv            # write CSV only
+python3 ctm_daily_executive_summary.py --export-json           # write JSON only
 ```
 
-## Daily Scheduling
+---
 
-Typical deployment is a scheduled job that runs once per day.
+## All options
 
-Example options:
+| Flag | Default | Description |
+|---|---|---|
+| `--time-duration` | `yesterday` | CTM time duration filter (`yesterday`, `today`, `last_7_days`, etc.) |
+| `--no-hydrate-details` | off | Skip per-call detail API calls (faster but may have less custom field data) |
+| `--no-webhook` | off | Skip posting to Make.com |
+| `--export-csv` | off | Write CSV exports |
+| `--export-json` | off | Write JSON export |
+| `--export-all` | off | Write CSV + JSON exports |
+| `--max-detail-rows N` | `75` | Max rows shown in the call detail table |
+| `--sleep-s F` | `0.1` | Seconds to sleep between per-call detail API requests |
 
-- PythonAnywhere scheduled task
-- Linux cron job
-- another hosted worker that can run Python on a schedule
+---
 
-The script does not require a web server. It just needs outbound network access to:
+## Scheduling
 
-- CTM API
-- Make webhook
+The script is designed to run unattended once per day. Any of the following work:
 
-## Make.com + Gmail Workflow
+- **PythonAnywhere** scheduled task — simplest option for Python-only deploys
+- **Linux cron**: `0 7 * * * /path/to/.venv/bin/python /path/to/ctm_daily_executive_summary.py`
+- **GitHub Actions** with a `schedule:` trigger
+- Any hosted job runner with outbound access to the CTM API and Make.com webhook
 
-Recommended Make scenario:
+The script needs no web server — just outbound network access.
 
-1. Custom Webhook module receives the HTML payload from this script.
-2. Gmail module sends an email using the webhook body as HTML content.
+---
 
-That means the full workflow requires access to:
+## Make.com + Gmail setup
 
-- CTM
-- Make.com
-- Gmail
-- a scheduled Python runtime
+1. Create a new Make scenario.
+2. Add a **Custom Webhook** module — copy its URL into `CTM_WEBHOOK_URL`.
+3. Add a **Gmail** module connected to your send account, configured to use the webhook payload as the HTML email body.
+4. Activate the scenario.
 
-## Swapping AI Custom Fields
+When the script runs and POSTs the HTML, Make routes it through Gmail automatically.
 
-The script is written around CTM `custom_fields`, but you can swap the mapped fields to use any AI-generated custom fields available in your CTM account.
+---
 
-The main mapping happens in:
+## Adapting to your CTM custom fields
 
-- `extract_call_record()`
+The script maps specific CTM AI custom fields inside `extract_call_record()`. If your account uses different field names, you can set these:
 
-Current examples include:
+```
+CTM_ONVERTED_FIELD   # booked/converted indicator
+CTM_SCORE_FIELD      # AI score field
+```
 
-- `custom_fields["service_type"]`
-- `custom_fields["call_outcome"]`
-- `custom_fields["did_the_caller_schedule"]`
-- `custom_fields["objections_reasons_not_scheduled"]`
-- `custom_fields["missed_questions"]`
-- `custom_fields["cumulative_score_percentage"]`
-- `custom_fields["explanation_of_outcome"]`
+Or pass:
 
-If your CTM AI setup uses different field names:
+```
+--converted-field <field_key>
+--score-field <field_key>
+```
 
-1. Update the keys inside `extract_call_record()`.
-2. If needed, update the aggregation logic in:
-   - `build_overview()`
-   - `build_agent_breakdown()`
-   - `build_source_breakdown()`
-   - `build_team_coaching_insights()`
-3. Update table headers or labels in `generate_html_report()` if the new fields describe different concepts.
+For other fields, update the keys in `extract_call_record()`:
 
-Example:
+```python
+# Current mappings in extract_call_record()
+cf.get("service_type")
+cf.get("call_outcome")
+cf.get("did_the_caller_schedule")
+cf.get("objections_reasons_not_scheduled")
+cf.get("missed_questions")
+cf.get("cumulative_score_percentage")
+cf.get("explanation_of_outcome")
+```
 
-If your account uses:
+If you rename any of these, also update the aggregation logic in `build_overview()`, `build_agent_breakdown()`, `build_source_breakdown()`, and `build_team_coaching_insights()`, and update the column labels in `generate_html_report()` to match.
 
-- `ai_summary_score`
-- `appointment_booked`
-- `primary_objection`
-
-then replace the existing references in `extract_call_record()` with those names and keep the rest of the pipeline the same.
+---
 
 ## Outputs
 
-Each run writes:
+Each run writes the following files dated to the report period:
 
-- HTML report
-- JSON summary
-- CSV exports for:
-  - calls
-  - agents
-  - sources
-  - agent/source combinations
+| File | Contents |
+|---|---|
+| `ctm_daily_summary_YYYY-MM-DD.html` | Full email-ready HTML report |
+| `ctm_daily_summary_YYYY-MM-DD.json` | Complete aggregated dashboard data |
+| `ctm_calls_YYYY-MM-DD.csv` | Raw normalized call records |
+| `ctm_agents_YYYY-MM-DD.csv` | Agent breakdown |
+| `ctm_sources_YYYY-MM-DD.csv` | Source breakdown |
+| `ctm_agent_sources_YYYY-MM-DD.csv` | Agent × source matrix |
 
-## Security Notes
+---
 
-- Do not commit real CTM tokens, webhook URLs, or account-specific identifiers.
-- Prefer environment variables or a secure secrets store for production.
-- If you use a hardcoded fallback during deployment, keep that version private.
+## Security
+
+- Never commit CTM API keys, webhook URLs, or account IDs to version control.
+- Use environment variables or a secrets manager in production.
+- The `.gitignore` in this repo excludes common credential file patterns.
+
+---
+
+## Files
+
+| File | Description |
+|---|---|
+| `ctm_daily_executive_summary.py` | Main script |
+| `requirements.txt` | Python dependencies |
