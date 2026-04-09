@@ -179,14 +179,6 @@ Each run writes the following files dated to the report period:
 
 ---
 
-## Security
-
-- Never commit CTM API keys, webhook URLs, or account IDs to version control.
-- Use environment variables or a secrets manager in production.
-- The `.gitignore` in this repo excludes common credential file patterns.
-
----
-
 ## Files
 
 | File | Description |
